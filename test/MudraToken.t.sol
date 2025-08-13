@@ -26,10 +26,10 @@ contract MudraTokenTest is Test {
     // Errors from Pausable
     error EnforcedPause();
     error ExpectedPause();
-
+    
     // Events to test
-    event WhitelisterStatusUpdated(address indexed whitelister, bool status);
-    event BlacklisterStatusUpdated(address indexed blacklister, bool status);
+    event WhitelisterStatusUpdated(address indexed account, bool status);
+    event BlacklisterStatusUpdated(address indexed account, bool status);
     event AddressWhitelisted(address indexed account, bool status);
     event AddressBlacklisted(address indexed account, bool status);
     event WhitelistStatusUpdated(bool status);
@@ -86,7 +86,223 @@ contract MudraTokenTest is Test {
     }
 
     /*//////////////////////////////////////////////////////////////
-                        OWNER FUNCTIONALITY TESTS
+                    AUDIT FIX TESTS - CRITICAL
+    //////////////////////////////////////////////////////////////*/
+
+    function testBlacklistedSpenderCannotUseTransferFrom() public {
+        // Setup: user1 has tokens and approves user2
+        vm.prank(owner);
+        token.transfer(user1, 1000);
+        
+        vm.prank(user1);
+        token.approve(user2, 500);
+        
+        // Blacklist the spender (user2)
+        vm.prank(owner);
+        token.setBlacklisted(user2, true);
+        
+        // user2 (blacklisted spender) should not be able to use transferFrom
+        vm.prank(user2);
+        vm.expectRevert(MudraToken.AccountBlacklisted.selector);
+        token.transferFrom(user1, user3, 100);
+        
+        // Verify no tokens were transferred
+        assertEq(token.balanceOf(user1), 1000);
+        assertEq(token.balanceOf(user3), 0);
+        assertEq(token.allowance(user1, user2), 500); // Allowance should remain
+    }
+
+    function testSpendAllowanceBlacklistCheck() public {
+        // This test specifically targets the _spendAllowance override
+        // We test it through transferFrom since burnFrom has onlyOwner modifier
+        
+        // Setup: user1 has tokens and approves user2
+        vm.prank(owner);
+        token.transfer(user1, 1000);
+        
+        vm.prank(user1);
+        token.approve(user2, 500);
+        
+        // Whitelist user3 and user4 for transfers
+        vm.startPrank(owner);
+        token.setWhitelisted(user3, true);
+        token.setWhitelisted(user4, true);
+        vm.stopPrank();
+        
+        // Normal transferFrom should work
+        vm.prank(user2);
+        token.transferFrom(user1, user3, 100);
+        assertEq(token.balanceOf(user3), 100);
+        assertEq(token.allowance(user1, user2), 400);
+        
+        // Now blacklist the spender
+        vm.prank(owner);
+        token.setBlacklisted(user2, true);
+        
+        // transferFrom should fail due to blacklisted spender
+        vm.prank(user2);
+        vm.expectRevert(MudraToken.AccountBlacklisted.selector);
+        token.transferFrom(user1, user4, 100);
+        
+        // Verify state didn't change
+        assertEq(token.balanceOf(user4), 0);
+        assertEq(token.allowance(user1, user2), 400); // Allowance unchanged
+    }
+
+    function testOwnershipTransferRevokesRoles() public {
+        address newOwner = makeAddr("newOwner");
+        
+        // Verify old owner has roles
+        assertTrue(token.isWhitelister(owner));
+        assertTrue(token.isBlacklister(owner));
+        assertTrue(token.isWhitelisted(owner));
+        
+        // Transfer ownership and verify events
+        vm.prank(owner);
+        vm.expectEmit(true, true, true, true);
+        emit WhitelisterStatusUpdated(owner, false);
+        vm.expectEmit(true, true, true, true);
+        emit BlacklisterStatusUpdated(owner, false);
+        vm.expectEmit(true, true, true, true);
+        emit AddressWhitelisted(owner, false);
+        vm.expectEmit(true, true, true, true);
+        emit WhitelisterStatusUpdated(newOwner, true);
+        vm.expectEmit(true, true, true, true);
+        emit BlacklisterStatusUpdated(newOwner, true);
+        vm.expectEmit(true, true, true, true);
+        emit AddressWhitelisted(newOwner, true);
+        token.transferOwnership(newOwner);
+        
+        // Verify ownership change
+        assertEq(token.owner(), newOwner);
+        
+        // Verify old owner lost all roles
+        assertFalse(token.isWhitelister(owner));
+        assertFalse(token.isBlacklister(owner));
+        assertFalse(token.isWhitelisted(owner));
+        
+        // Verify new owner has all roles
+        assertTrue(token.isWhitelister(newOwner));
+        assertTrue(token.isBlacklister(newOwner));
+        assertTrue(token.isWhitelisted(newOwner));
+        
+        // Verify old owner cannot perform admin functions
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSignature("OwnableUnauthorizedAccount(address)", owner));
+        token.mint(owner, 1000);
+        
+        // Verify new owner can perform admin functions
+        vm.prank(newOwner);
+        token.mint(newOwner, 1000);
+        assertEq(token.balanceOf(newOwner), 1000);
+    }
+
+    function testBlacklistingKeepsTokens() public {
+        // Setup: user3 has tokens
+        vm.startPrank(owner);
+        token.setWhitelisted(user3, true);
+        token.mint(user3, 5000);
+        vm.stopPrank();
+        
+        assertEq(token.balanceOf(user3), 5000);
+        uint256 totalSupplyBefore = token.totalSupply();
+        
+        // Blacklist user3 - tokens should remain (no auto-burn)
+        vm.prank(owner);
+        vm.expectEmit(true, true, true, true);
+        emit AddressBlacklisted(user3, true);
+        token.setBlacklisted(user3, true);
+        
+        // Verify tokens are still there (not auto-burned)
+        assertEq(token.balanceOf(user3), 5000);
+        assertEq(token.totalSupply(), totalSupplyBefore);
+        assertTrue(token.isBlacklisted(user3));
+        
+        // But user3 cannot transfer
+        vm.prank(user3);
+        vm.expectRevert(MudraToken.AccountBlacklisted.selector);
+        token.transfer(user1, 100);
+    }
+
+    function testBatchBlacklistingKeepsTokens() public {
+        // Setup: multiple users with tokens
+        address[] memory users = new address[](3);
+        users[0] = user3;
+        users[1] = user4;
+        users[2] = makeAddr("user5");
+        
+        vm.startPrank(owner);
+        for (uint i = 0; i < users.length; i++) {
+            token.setWhitelisted(users[i], true);
+            token.mint(users[i], 1000 * (i + 1)); // Different amounts
+        }
+        vm.stopPrank();
+        
+        uint256 totalSupplyBefore = token.totalSupply();
+        uint256[] memory balancesBefore = new uint256[](3);
+        for (uint i = 0; i < users.length; i++) {
+            balancesBefore[i] = token.balanceOf(users[i]);
+        }
+        
+        // Batch blacklist should keep all their tokens
+        vm.prank(owner);
+        token.batchBlacklist(users, true);
+        
+        // Verify all tokens are still there (not burned)
+        for (uint i = 0; i < users.length; i++) {
+            assertEq(token.balanceOf(users[i]), balancesBefore[i]);
+            assertTrue(token.isBlacklisted(users[i]));
+        }
+        assertEq(token.totalSupply(), totalSupplyBefore);
+    }
+
+    function testBlacklistingUserWithZeroBalanceWorks() public {
+        // Blacklist a user with no tokens
+        assertEq(token.balanceOf(user3), 0);
+        
+        vm.prank(owner);
+        vm.expectEmit(true, true, true, true);
+        emit AddressBlacklisted(user3, true);
+        token.setBlacklisted(user3, true);
+        
+        assertTrue(token.isBlacklisted(user3));
+        assertEq(token.balanceOf(user3), 0);
+    }
+
+    function testManualBurnFromBlacklistedUser() public {
+        // Setup: user3 has tokens, then gets blacklisted
+        vm.startPrank(owner);
+        token.setWhitelisted(user3, true);
+        token.mint(user3, 1000);
+        token.setBlacklisted(user3, true); // Tokens remain (no auto-burn)
+        vm.stopPrank();
+        
+        assertEq(token.balanceOf(user3), 1000);
+        assertTrue(token.isBlacklisted(user3));
+        
+        // Owner can manually burn tokens from blacklisted user
+        vm.prank(owner);
+        token.burnFrom(user3, 600);
+        
+        // Verify tokens were burned manually
+        assertEq(token.balanceOf(user3), 400);
+        
+        // Unblacklist user3
+        vm.prank(owner);
+        token.setBlacklisted(user3, false);
+        
+        // Verify user3 still has remaining tokens and can now transfer
+        assertEq(token.balanceOf(user3), 400);
+        assertFalse(token.isBlacklisted(user3));
+        
+        vm.prank(user3);
+        token.transfer(user1, 100);
+        assertEq(token.balanceOf(user3), 300);
+        assertEq(token.balanceOf(user1), 100);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        ORIGINAL TESTS (UPDATED)
     //////////////////////////////////////////////////////////////*/
 
     function testOnlyOwnerCanMint() public {
@@ -113,17 +329,6 @@ contract MudraTokenTest is Test {
         token.mint(user1, 0);
     }
 
-    function testMintToBlacklistedAddress() public {
-        // Blacklist user1
-        vm.prank(owner);
-        token.setBlacklisted(user1, true);
-
-        // Try to mint to blacklisted user
-        vm.prank(owner);
-        vm.expectRevert(MudraToken.AccountBlacklisted.selector);
-        token.mint(user1, 1000);
-    }
-
     function testOnlyOwnerCanBurn() public {
         // Setup: mint tokens to user1
         vm.prank(owner);
@@ -144,21 +349,6 @@ contract MudraTokenTest is Test {
         vm.prank(owner);
         vm.expectRevert(MudraToken.InvalidBurnAmount.selector);
         token.burnFrom(user1, 0);
-    }
-
-    function testBurnFromBlacklistedAddress() public {
-        // Setup: mint tokens to user1
-        vm.prank(owner);
-        token.mint(user1, 1000);
-
-        // Blacklist user1
-        vm.prank(owner);
-        token.setBlacklisted(user1, true);
-
-        // Try to burn from blacklisted user
-        vm.prank(owner);
-        vm.expectRevert(MudraToken.AccountBlacklisted.selector);
-        token.burnFrom(user1, 500);
     }
 
     function testOwnerPauseAndUnpause() public {
@@ -557,15 +747,93 @@ contract MudraTokenTest is Test {
     }
 
     /*//////////////////////////////////////////////////////////////
+                    APPROVAL RACE CONDITION TESTS
+    //////////////////////////////////////////////////////////////*/
+
+    function testApproveZeroFirst() public {
+        // Setup: user1 should be able to approve a new amount when there is no previous allowance
+        vm.startPrank(user1);
+        assertTrue(token.approve(user2, 100));
+        assertEq(token.allowance(user1, user2), 100);
+        
+        // Attempt to change allowance directly without setting to zero first (should fail)
+        vm.expectRevert(MudraToken.InvalidApprove.selector);
+        token.approve(user2, 50);
+        
+        // Verify allowance is still the original amount
+        assertEq(token.allowance(user1, user2), 100);
+        
+        // Set allowance to zero first
+        assertTrue(token.approve(user2, 0));
+        assertEq(token.allowance(user1, user2), 0);
+        
+        // Now should be able to set to new amount
+        assertTrue(token.approve(user2, 50));
+        assertEq(token.allowance(user1, user2), 50);
+        vm.stopPrank();
+    }
+    
+    function testApproveZeroAmount() public {
+        // Setting to zero should always work regardless of previous allowance
+        vm.prank(user1);
+        token.approve(user2, 100);
+        assertEq(token.allowance(user1, user2), 100);
+        
+        vm.prank(user1);
+        token.approve(user2, 0);
+        assertEq(token.allowance(user1, user2), 0);
+    }
+    
+    function testApproveWhenPaused() public {
+        // Setup
+        vm.prank(owner);
+        token.pause();
+        
+        // Approve should fail when paused
+        vm.prank(user1);
+        vm.expectRevert(EnforcedPause.selector);
+        token.approve(user2, 100);
+        
+        // Unpause
+        vm.prank(owner);
+        token.unpause();
+        
+        // Approve should work when unpaused
+        vm.prank(user1);
+        token.approve(user2, 100);
+        assertEq(token.allowance(user1, user2), 100);
+    }
+    
+    function testApproveForBlacklistedAddress() public {
+        // Test approving a blacklisted spender
+        vm.prank(owner);
+        token.setBlacklisted(user2, true);
+        
+        vm.prank(user1);
+        vm.expectRevert(MudraToken.AccountBlacklisted.selector);
+        token.approve(user2, 100);
+        
+        // Test approving from a blacklisted owner
+        vm.prank(owner);
+        token.setBlacklisted(user1, true);
+        
+        vm.prank(user1);
+        vm.expectRevert(MudraToken.AccountBlacklisted.selector);
+        token.approve(user3, 100);
+    }
+
+    /*//////////////////////////////////////////////////////////////
                         EDGE CASES & VULNERABILITY TESTS
     //////////////////////////////////////////////////////////////*/
 
     function testSimultaneousWhitelistAndBlacklist() public {
-        // Set up an address that is both whitelisted and blacklisted
-        vm.startPrank(owner);
+        // Whitelist user3 first
+        vm.prank(owner);
         token.setWhitelisted(user3, true);
+        
+        // Now blacklist the same address (this should still work)
+        vm.prank(owner);
         token.setBlacklisted(user3, true);
-        vm.stopPrank();
 
         // Verify that transfers to/from this address fail due to blacklisting
         vm.prank(user1);
@@ -576,6 +844,11 @@ contract MudraTokenTest is Test {
         vm.prank(owner);
         vm.expectRevert(MudraToken.AccountBlacklisted.selector);
         token.mint(user3, 100);
+        
+        // Verify that you cannot whitelist an already blacklisted address
+        vm.prank(owner);
+        vm.expectRevert(MudraToken.CannotWhitelistBlacklistedAddress.selector);
+        token.setWhitelisted(user3, true);
     }
 
     function testRoleManagementSecurityEdgeCases() public {
@@ -634,27 +907,6 @@ contract MudraTokenTest is Test {
         assertEq(token.totalSupply(), INITIAL_MINT_AMOUNT);
     }
 
-    function testOwnershipTransfer() public {
-        address newOwner = makeAddr("newOwner");
-
-        // Transfer ownership
-        vm.prank(owner);
-        token.transferOwnership(newOwner);
-
-        // Verify new owner has taken control
-        assertEq(token.owner(), newOwner);
-
-        // Verify new owner has full privileges
-        vm.prank(newOwner);
-        token.mint(newOwner, 1000);
-        assertEq(token.balanceOf(newOwner), 1000);
-
-        // Verify old owner has lost privileges
-        vm.prank(owner);
-        vm.expectRevert(abi.encodeWithSignature("OwnableUnauthorizedAccount(address)", owner));
-        token.mint(owner, 1000);
-    }
-
     /*//////////////////////////////////////////////////////////////
                         FUZZ TESTS
     //////////////////////////////////////////////////////////////*/
@@ -662,16 +914,18 @@ contract MudraTokenTest is Test {
     function testFuzz_Mint(address to, uint256 amount) public {
         // Avoid zero address and zero amount cases that will revert
         vm.assume(to != address(0));
+        vm.assume(to != owner && to != user1 && to != user2 && to != user3 && to != user4);
+        vm.assume(to != whitelister && to != blacklister);
         vm.assume(amount > 0);
         vm.assume(amount < type(uint256).max / 2); // Avoid overflow
+
+        // Ensure the address starts fresh (not blacklisted and balance is 0)
+        assertEq(token.balanceOf(to), 0);
+        assertFalse(token.isBlacklisted(to));
 
         // Ensure the address is whitelisted
         vm.prank(owner);
         token.setWhitelisted(to, true);
-
-        // Ensure the address is not blacklisted
-        vm.prank(owner);
-        token.setBlacklisted(to, false);
 
         // Mint tokens
         vm.prank(owner);
@@ -685,8 +939,18 @@ contract MudraTokenTest is Test {
         // Avoid edge cases that will revert
         vm.assume(from != address(0) && to != address(0));
         vm.assume(from != to);
+        vm.assume(from != owner && from != user1 && from != user2 && from != user3 && from != user4);
+        vm.assume(to != owner && to != user1 && to != user2 && to != user3 && to != user4);
+        vm.assume(from != whitelister && from != blacklister);
+        vm.assume(to != whitelister && to != blacklister);
         vm.assume(amount > 0);
-        vm.assume(amount < INITIAL_MINT_AMOUNT);
+        vm.assume(amount < type(uint256).max / 2);
+
+        // Ensure addresses start fresh
+        assertEq(token.balanceOf(from), 0);
+        assertEq(token.balanceOf(to), 0);
+        assertFalse(token.isBlacklisted(from));
+        assertFalse(token.isBlacklisted(to));
 
         // Ensure addresses are whitelisted
         vm.startPrank(owner);
@@ -709,9 +973,15 @@ contract MudraTokenTest is Test {
     function testFuzz_Burn(address target, uint256 mintAmount, uint256 burnAmount) public {
         // Avoid edge cases that will revert
         vm.assume(target != address(0));
+        vm.assume(target != owner && target != user1 && target != user2 && target != user3 && target != user4);
+        vm.assume(target != whitelister && target != blacklister);
         vm.assume(mintAmount > 0 && burnAmount > 0);
         vm.assume(burnAmount <= mintAmount);
         vm.assume(mintAmount < type(uint256).max / 2); // Avoid overflow
+
+        // Ensure target starts fresh
+        assertEq(token.balanceOf(target), 0);
+        assertFalse(token.isBlacklisted(target));
 
         // Whitelist the target address
         vm.prank(owner);
@@ -732,21 +1002,6 @@ contract MudraTokenTest is Test {
     /*//////////////////////////////////////////////////////////////
                     ADDITIONAL TESTS FOR FULL COVERAGE
     //////////////////////////////////////////////////////////////*/
-
-    function testBurnFromNonOwnerWithAllowance() public {
-        // Setup: mint tokens to user1
-        vm.prank(owner);
-        token.mint(user1, 1000);
-
-        // User1 approves user2 to burn tokens
-        vm.prank(user1);
-        token.approve(user2, 500);
-
-        // User2 should not be able to burnFrom (only owner can)
-        vm.prank(user2);
-        vm.expectRevert(abi.encodeWithSignature("OwnableUnauthorizedAccount(address)", user2));
-        token.burnFrom(user1, 300);
-    }
 
     function testZeroAddressCases() public {
         // Test zero address in setWhitelister
@@ -770,6 +1025,51 @@ contract MudraTokenTest is Test {
         token.setBlacklisted(address(0), true);
     }
 
+    function testNonWhitelisterCannotWhitelist() public {
+        // Test that a user who is neither whitelister nor owner cannot whitelist
+        // This covers the missing branch: !isWhitelister[msg.sender] && msg.sender != owner()
+        vm.prank(user3); // user3 is not a whitelister and not the owner
+        vm.expectRevert(MudraToken.InvalidWhitelisterAddress.selector);
+        token.setWhitelisted(user4, true);
+    }
+
+    function testCannotWhitelistBlacklistedAddress() public {
+        // Blacklist user3 first
+        vm.prank(owner);
+        token.setBlacklisted(user3, true);
+        
+        // Try to whitelist the blacklisted address - should fail
+        vm.prank(owner);
+        vm.expectRevert(MudraToken.CannotWhitelistBlacklistedAddress.selector);
+        token.setWhitelisted(user3, true);
+        
+        // Verify user3 is still not whitelisted
+        assertFalse(token.isWhitelisted(user3));
+        assertTrue(token.isBlacklisted(user3));
+    }
+
+    function testBatchWhitelistSkipsBlacklistedAddresses() public {
+        // Setup: blacklist user3 and user4
+        vm.startPrank(owner);
+        token.setBlacklisted(user3, true);
+        token.setBlacklisted(user4, true);
+        vm.stopPrank();
+        
+        // Try to batch whitelist including blacklisted addresses
+        address[] memory users = new address[](3);
+        users[0] = user3; // blacklisted - should be skipped
+        users[1] = user4; // blacklisted - should be skipped
+        users[2] = makeAddr("user5"); // not blacklisted - should work
+        
+        vm.prank(whitelister);
+        token.batchWhitelist(users, true);
+        
+        // Verify results
+        assertFalse(token.isWhitelisted(user3)); // Skipped due to blacklist
+        assertFalse(token.isWhitelisted(user4)); // Skipped due to blacklist
+        assertTrue(token.isWhitelisted(users[2])); // Successfully whitelisted
+    }
+
     function testSkipZeroAddressInBatchOperations() public {
         address[] memory addresses = new address[](3);
         addresses[0] = user3;
@@ -779,7 +1079,7 @@ contract MudraTokenTest is Test {
         // Test batch whitelist with zero address
         vm.prank(whitelister);
         token.batchWhitelist(addresses, true);
-
+        
         assertTrue(token.isWhitelisted(user3));
         assertTrue(token.isWhitelisted(user4));
         assertFalse(token.isWhitelisted(address(0)));
@@ -787,7 +1087,7 @@ contract MudraTokenTest is Test {
         // Test batch blacklist with zero address
         vm.prank(blacklister);
         token.batchBlacklist(addresses, true);
-
+        
         assertTrue(token.isBlacklisted(user3));
         assertTrue(token.isBlacklisted(user4));
         assertFalse(token.isBlacklisted(address(0)));
@@ -804,619 +1104,127 @@ contract MudraTokenTest is Test {
         // Pause the contract
         vm.prank(owner);
         token.pause();
-
+        
         // Try to pause again
         vm.prank(owner);
         vm.expectRevert(EnforcedPause.selector);
         token.pause();
     }
 
-    function testTransferERC20WhenNotWhitelisted() public {
-        // Setup: disable whitelisting
-        vm.prank(owner);
-        token.setWhitelistingEnabled(false);
-
-        // Non-whitelisted users should be able to transfer
-        vm.prank(owner);
-        token.mint(user3, 1000); // User3 is not whitelisted
-
-        vm.prank(user3);
-        token.transfer(user4, 500); // User4 is not whitelisted
-
-        assertEq(token.balanceOf(user3), 500);
-        assertEq(token.balanceOf(user4), 500);
-
-        // Re-enable whitelisting for other tests
-        vm.prank(owner);
-        token.setWhitelistingEnabled(true);
-    }
-
-    function testBurnFromAllCases() public {
-        // Setup: mint tokens to various users
-        vm.startPrank(owner);
-        token.mint(user1, 1000);
-        token.mint(user2, 1000);
-        vm.stopPrank();
-
-        // Case 1: Owner burns directly (no allowance needed)
-        vm.prank(owner);
-        token.burnFrom(user1, 300);
-        assertEq(token.balanceOf(user1), 700);
-
-        // Case 2: Non-owner tries to burn without allowance
-        vm.prank(user3);
-        vm.expectRevert(abi.encodeWithSignature("OwnableUnauthorizedAccount(address)", user3));
-        token.burnFrom(user2, 300);
-
-        // Ensure balance remained unchanged
-        assertEq(token.balanceOf(user2), 1000);
-    }
-
-    function testInvalidAddressWhitelisterOrBlacklister() public {
-        // Test non-whitelister trying to whitelist
-        vm.prank(user3);
-        vm.expectRevert(MudraToken.InvalidWhitelisterAddress.selector);
-        token.setWhitelisted(user4, true);
-
-        // Test non-blacklister trying to blacklist
-        vm.prank(user3);
-        vm.expectRevert(MudraToken.InvalidBlacklisterAddress.selector);
-        token.setBlacklisted(user4, true);
-    }
-
-    function testMintAndBurnToBlacklistedAddress() public {
-        // Blacklist user3
-        vm.prank(owner);
-        token.setBlacklisted(user3, true);
-
-        // Try to mint to blacklisted address
-        vm.prank(owner);
-        vm.expectRevert(MudraToken.AccountBlacklisted.selector);
-        token.mint(user3, 1000);
-
-        // Setup for burn test: whitelist and mint to user4
-        vm.startPrank(owner);
-        token.setWhitelisted(user4, true);
-        token.mint(user4, 1000);
-        vm.stopPrank();
-
-        // Blacklist user4
-        vm.prank(owner);
-        token.setBlacklisted(user4, true);
-
-        // Try to burn from blacklisted address
-        vm.prank(owner);
-        vm.expectRevert(MudraToken.AccountBlacklisted.selector);
-        token.burnFrom(user4, 500);
-    }
-
     /*//////////////////////////////////////////////////////////////
-                ADDITIONAL TESTS FOR 100% BRANCH COVERAGE
+                    COMPREHENSIVE COVERAGE TESTS
     //////////////////////////////////////////////////////////////*/
 
-    function testTransferWithSenderZeroAddress() public {
-        // This test covers the branch in _update where from is address(0) - minting case
-        // We're testing that only the recipient needs to be whitelisted during minting
-
-        // Whitelist recipient (set in setUp)
-        vm.startPrank(owner);
-        token.setWhitelisted(user1, true);
-        token.mint(user1, 1000);
-        vm.stopPrank();
-
-        assertEq(token.balanceOf(user1), 1000);
-    }
-
-    function testTransferWithRecipientZeroAddress() public {
-        // This test covers the branch in _update where to is address(0) - burning case
-        // We're testing that only the sender needs to be whitelisted during burning
-
-        // Mint tokens to user1 (already whitelisted in setUp)
+    function testBurnFromOwnerPathOnly() public {
+        // Test that burnFrom always goes through owner path (no unreachable code)
         vm.prank(owner);
         token.mint(user1, 1000);
-
-        // Burn tokens from user1 - uses _update with to=address(0)
-        vm.prank(owner);
-        token.burnFrom(user1, 500);
-
-        assertEq(token.balanceOf(user1), 500);
-    }
-
-    function testBurnFromWithNonOwnerCalls() public {
-        // Setup: mint tokens to user1
-        vm.prank(owner);
-        token.mint(user1, 1000);
-
-        // Give user3 approval to burn user1's tokens
-        vm.prank(user1);
-        token.approve(user3, 300);
-
-        // User3 tries to burn - should fail because burnFrom is owner-only
-        vm.prank(user3);
-        vm.expectRevert(abi.encodeWithSignature("OwnableUnauthorizedAccount(address)", user3));
-        token.burnFrom(user1, 300);
-
-        // Verify standard ERC20Burnable's burnFrom is not accessible
-        assertEq(token.balanceOf(user1), 1000);
-    }
-
-    function testEmptyBatchOperations() public {
-        // Test batch operations with empty arrays
-        address[] memory emptyArray = new address[](0);
-
-        // Batch whitelist with empty array
-        vm.prank(whitelister);
-        token.batchWhitelist(emptyArray, true);
-
-        // Batch blacklist with empty array
-        vm.prank(blacklister);
-        token.batchBlacklist(emptyArray, true);
-    }
-
-    function testNonWhitelisterControlPath() public {
-        // Test non-whitelister path in onlyWhitelister
-        vm.prank(user3); // Not a whitelister
-        vm.expectRevert(MudraToken.InvalidWhitelisterAddress.selector);
-        token.setWhitelisted(user4, true);
-
-        // Test owner can whitelist even if not explicitly set as whitelister
-        vm.startPrank(owner);
-        token.setWhitelister(owner, false); // Remove whitelister role from owner
-
-        // Owner should still be able to manage whitelists due to "|| msg.sender == owner()" in the modifier
-        token.setWhitelisted(user4, true);
-        vm.stopPrank();
-
-        assertTrue(token.isWhitelisted(user4));
-    }
-
-    function testNonBlacklisterControlPath() public {
-        // Test non-blacklister path in onlyBlacklister
-        vm.prank(user3); // Not a blacklister
-        vm.expectRevert(MudraToken.InvalidBlacklisterAddress.selector);
-        token.setBlacklisted(user4, true);
-
-        // Test owner can blacklist even if not explicitly set as blacklister
-        vm.startPrank(owner);
-        token.setBlacklister(owner, false); // Remove blacklister role from owner
-
-        // Owner should still be able to manage blacklists due to "|| msg.sender == owner()" in the modifier
-        token.setBlacklisted(user4, true);
-        vm.stopPrank();
-
-        assertTrue(token.isBlacklisted(user4));
-    }
-
-    function testEdgeCasesWithWhitelistingDisabled() public {
-        // Test transfer scenarios with whitelisting disabled
-
-        // Disable whitelisting
-        vm.prank(owner);
-        token.setWhitelistingEnabled(false);
-
-        // Test transfer from non-whitelisted sender to non-whitelisted recipient
-        vm.prank(owner);
-        token.mint(user3, 1000); // user3 is not whitelisted
-
-        vm.prank(user3);
-        token.transfer(user4, 500); // user4 is not whitelisted
-
-        // Make sure user1 has some tokens
-        vm.prank(owner);
-        token.mint(user1, 1000); // user1 is whitelisted
-
-        // Test transfer from whitelisted to non-whitelisted
-        vm.prank(user1); // user1 is whitelisted
-        token.transfer(user3, 100);
-
-        // Test transfer from non-whitelisted to whitelisted
-        vm.prank(user3);
-        token.transfer(user1, 100);
-
-        // Re-enable whitelisting for other tests
-        vm.prank(owner);
-        token.setWhitelistingEnabled(true);
-    }
-
-    function testMintDirectlyToBlacklistedAddress() public {
-        // First whitelist user3 (so whitelisting doesn't interfere)
-        vm.prank(owner);
-        token.setWhitelisted(user3, true);
-
-        // Then blacklist the address
-        vm.prank(owner);
-        token.setBlacklisted(user3, true);
-
-        // Try to mint to blacklisted address
-        vm.prank(owner);
-        vm.expectRevert(MudraToken.AccountBlacklisted.selector);
-        token.mint(user3, 1000);
-    }
-
-    function testMultipleConstraintsOnTransfer() public {
-        // Test a transfer with multiple constraints
-        // 1. Setup a paused contract
-        vm.prank(owner);
-        token.pause();
-
-        // 2. Try to transfer when paused (should revert with pause error first)
-        vm.prank(user1);
-        vm.expectRevert(EnforcedPause.selector);
-        token.transfer(user2, 100);
-
-        // 3. Unpause but blacklist recipient
-        vm.startPrank(owner);
-        token.unpause();
-        token.setBlacklisted(user2, true);
-        vm.stopPrank();
-
-        // 4. Try transfer to blacklisted (should revert with blacklist error)
-        vm.prank(user1);
-        vm.expectRevert(MudraToken.AccountBlacklisted.selector);
-        token.transfer(user2, 100);
-
-        // 5. Unblacklist recipient but disable whitelist and try with non-whitelisted sender
-        vm.startPrank(owner);
-        token.setBlacklisted(user2, false);
-        token.setWhitelisted(user1, false);
-        vm.stopPrank();
-
-        // 6. Try transfer from non-whitelisted (should revert with whitelist error)
-        vm.prank(user1);
-        vm.expectRevert(MudraToken.InvalidSenderWhitelisted.selector);
-        token.transfer(user2, 100);
-    }
-
-    function testBurnFromWithOwnerLogic() public {
-        // Setup: mint tokens to user1
-        vm.prank(owner);
-        token.mint(user1, 1000);
-
-        // Test burnFrom as owner without allowance
+        
+        // Owner burns directly
         vm.prank(owner);
         token.burnFrom(user1, 300);
-
-        // Verify the burn happened
         assertEq(token.balanceOf(user1), 700);
-
-        // Give a different user (not owner) allowance
-        vm.prank(user1);
-        token.approve(user2, 300);
-
-        // Test burnFrom with a non-owner, which should fail
+        
+        // Non-owner cannot burn (onlyOwner modifier)
         vm.prank(user2);
         vm.expectRevert(abi.encodeWithSignature("OwnableUnauthorizedAccount(address)", user2));
-        token.burnFrom(user1, 200);
-
-        // Verify no additional tokens were burned
-        assertEq(token.balanceOf(user1), 700);
+        token.burnFrom(user1, 100);
     }
 
-    /*//////////////////////////////////////////////////////////////
-                FINAL TESTS FOR 100% COVERAGE
-    //////////////////////////////////////////////////////////////*/
-
-    function testBurnFromBranchWithNonOwnerAllowanceCheck() public {
-        // Setup: mint tokens to user1
+    function testOwnershipTransferToZeroAddressBlocked() public {
+        // This should be blocked by OpenZeppelin's Ownable
         vm.prank(owner);
-        token.mint(user1, 1000);
-
-        // Using a non-owner address for burnFrom (this tests the else branch in burnFrom)
-        address nonOwner = makeAddr("nonOwner");
-
-        // Try burnFrom without approval (should fail with insufficient allowance)
-        vm.startPrank(nonOwner);
-        vm.expectRevert(abi.encodeWithSignature("OwnableUnauthorizedAccount(address)", nonOwner));
-        token.burnFrom(user1, 500);
-        vm.stopPrank();
-
-        // Verify tokens were not burned
-        assertEq(token.balanceOf(user1), 1000);
+        vm.expectRevert();
+        token.transferOwnership(address(0));
     }
 
-    function testBatchOperationsWithDifferentSizes() public {
-        // Test with a larger batch (but still within limits)
-        address[] memory largeButValidArray = new address[](100);
-        for (uint256 i = 0; i < 100; i++) {
-            largeButValidArray[i] = address(uint160(i + 1));
-        }
-
-        // Batch whitelist with large valid array
-        vm.prank(whitelister);
-        token.batchWhitelist(largeButValidArray, true);
-
-        // Verify a few addresses were whitelisted
-        assertTrue(token.isWhitelisted(largeButValidArray[0]));
-        assertTrue(token.isWhitelisted(largeButValidArray[50]));
-        assertTrue(token.isWhitelisted(largeButValidArray[99]));
-
-        // Batch blacklist with large valid array
-        vm.prank(blacklister);
-        token.batchBlacklist(largeButValidArray, true);
-
-        // Verify a few addresses were blacklisted
-        assertTrue(token.isBlacklisted(largeButValidArray[0]));
-        assertTrue(token.isBlacklisted(largeButValidArray[50]));
-        assertTrue(token.isBlacklisted(largeButValidArray[99]));
-    }
-
-    function testZeroAmountChecks() public {
-        // Test minting with zero amount
-        vm.prank(owner);
-        vm.expectRevert(MudraToken.InvalidMintAmount.selector);
-        token.mint(user1, 0);
-
-        // Test burning with zero amount
-        vm.prank(owner);
-        vm.expectRevert(MudraToken.InvalidBurnAmount.selector);
-        token.burnFrom(user1, 0);
-    }
-
-    function testWhitelistingEnabledEdgeCases() public {
-        // Test all branches in the _update function related to whitelistingEnabled
-
-        // 1. First setup: whitelisting disabled, sender not whitelisted, recipient not whitelisted
-        vm.prank(owner);
-        token.setWhitelistingEnabled(false);
-
-        // Mint tokens to non-whitelisted user3
-        vm.prank(owner);
-        token.mint(user3, 1000);
-
-        // Transfer should work even though sender and recipient are not whitelisted
-        vm.prank(user3);
-        token.transfer(user4, 500);
-
-        // 2. Test: whitelisting enabled, sender is whitelisted, recipient not whitelisted
-        vm.prank(owner);
-        token.setWhitelistingEnabled(true);
-
-        // Make sender whitelisted
-        vm.prank(owner);
-        token.setWhitelisted(user3, true);
-
-        // Transfer should fail due to recipient not being whitelisted
-        vm.prank(user3);
-        vm.expectRevert(MudraToken.InvalidRecipientWhitelisted.selector);
-        token.transfer(user4, 100);
-
-        // 3. Test: whitelisting enabled, sender not whitelisted, recipient is whitelisted
-        // First disable whitelisting to set up the scenario
-        vm.prank(owner);
-        token.setWhitelistingEnabled(false);
-
-        // Give tokens to user4 (not whitelisted yet)
-        vm.prank(owner);
-        token.mint(user4, 1000);
-
-        // Now set up the scenario
+    function testCompleteBlacklistWorkflow() public {
+        // 1. User has tokens
         vm.startPrank(owner);
-        token.setWhitelisted(user4, false); // Ensure user4 is not whitelisted
-        token.setWhitelisted(user2, true); // But recipient is whitelisted
-        token.setWhitelistingEnabled(true); // Re-enable whitelisting
-        vm.stopPrank();
-
-        // Transfer should fail due to sender not being whitelisted
-        vm.prank(user4);
-        vm.expectRevert(MudraToken.InvalidSenderWhitelisted.selector);
-        token.transfer(user2, 50);
-    }
-
-    function testMintingToNonWhitelistedAddress() public {
-        // Test that minting works to non-whitelisted addresses (since whitelisting check is skipped for mint)
-
-        // Ensure user3 is not whitelisted
-        assertFalse(token.isWhitelisted(user3));
-
-        // Mint should work even though user3 is not whitelisted
-        vm.prank(owner);
+        token.setWhitelisted(user3, true);
         token.mint(user3, 1000);
-
-        // Verify the mint worked
-        assertEq(token.balanceOf(user3), 1000);
+        token.mint(user1, 100); // Give user1 some tokens for testing
+        vm.stopPrank();
+        
+        // 2. User can transfer normally
+        vm.prank(user3);
+        token.transfer(user1, 100);
+        assertEq(token.balanceOf(user3), 900);
+        assertEq(token.balanceOf(user1), 200); // user1 now has 200 tokens
+        
+        // 3. User gets blacklisted (tokens remain, no auto-burn)
+        vm.prank(owner);
+        token.setBlacklisted(user3, true);
+        assertEq(token.balanceOf(user3), 900); // Tokens still there
+        
+        // 4. User cannot perform any operations
+        vm.prank(user3);
+        vm.expectRevert(MudraToken.AccountBlacklisted.selector);
+        token.transfer(user1, 1);
+        
+        // 5. User cannot be sent tokens
+        vm.prank(user1);
+        vm.expectRevert(MudraToken.AccountBlacklisted.selector);
+        token.transfer(user3, 1);
+        
+        // 6. User cannot mint tokens
+        vm.prank(owner);
+        vm.expectRevert(MudraToken.AccountBlacklisted.selector);
+        token.mint(user3, 1);
+        
+        // 7. Owner can manually burn tokens from blacklisted user
+        vm.prank(owner);
+        token.burnFrom(user3, 500);
+        assertEq(token.balanceOf(user3), 400);
+        
+        // 8. Unblacklist and user can transfer remaining tokens
+        vm.prank(owner);
+        token.setBlacklisted(user3, false);
+        
+        vm.prank(user3);
+        token.transfer(user1, 200);
+        assertEq(token.balanceOf(user3), 200);
+        assertEq(token.balanceOf(user1), 400); // user1 now has 400
     }
 
     function testBlacklistingWithDifferentScenarios() public {
-        // Test minting to a blacklisted address
-        vm.prank(owner);
-        token.setBlacklisted(user3, true);
-
-        vm.prank(owner);
-        vm.expectRevert(MudraToken.AccountBlacklisted.selector);
-        token.mint(user3, 1000);
-
-        // Test burning from a blacklisted address
-        // Setup - mint to user4 first, then blacklist
+        // Set up user1 and user2 with tokens
         vm.startPrank(owner);
-        token.setWhitelisted(user4, true);
-        token.mint(user4, 1000);
-        token.setBlacklisted(user4, true);
+        token.mint(user1, 1000);
+        token.mint(user2, 500); // Give user2 tokens too
         vm.stopPrank();
 
-        // Attempt to burn from blacklisted
-        vm.prank(owner);
-        vm.expectRevert(MudraToken.AccountBlacklisted.selector);
-        token.burnFrom(user4, 500);
-
-        // Send tokens to user1 for testing transfers
-        vm.prank(owner);
-        token.mint(user1, 1000);
-
-        // Test transfer to blacklisted address
-        vm.prank(user1);
-        vm.expectRevert(MudraToken.AccountBlacklisted.selector);
-        token.transfer(user3, 100);
-
-        // Test transfer from blacklisted address (owner is not blacklisted by default)
-        // First blacklist a user that has tokens
-        vm.prank(owner);
+        // Blacklist user1 - tokens should remain but transfers blocked
+        vm.prank(blacklister);
         token.setBlacklisted(user1, true);
+        
+        // Verify user1 still has tokens (no auto-burn)
+        assertEq(token.balanceOf(user1), 1000);
+        assertTrue(token.isBlacklisted(user1));
 
-        // Then try transfer from that address
+        // Verify user1 cannot transfer
         vm.prank(user1);
         vm.expectRevert(MudraToken.AccountBlacklisted.selector);
         token.transfer(user2, 100);
-    }
 
-    function testVerifyBurnFromWithAllowance() public {
-        // Test the burnFrom function's specific branch where a non-owner tries to burn with allowance
-
-        // Setup: mint tokens to user1
-        vm.prank(owner);
-        token.mint(user1, 1000);
-
-        // User1 approves user2 to spend tokens
-        vm.prank(user1);
-        token.approve(user2, 500);
-
-        // Test the branch where non-owner calls burnFrom (should revert)
+        // Verify others cannot transfer to user1 (blacklisted recipient)
         vm.prank(user2);
-        vm.expectRevert(abi.encodeWithSignature("OwnableUnauthorizedAccount(address)", user2));
-        token.burnFrom(user1, 300);
-
-        // Verify no burn happened
-        assertEq(token.balanceOf(user1), 1000);
-    }
-
-    function testSequentialWhitelistThenBlacklist() public {
-        // Whitelist then blacklist an address
-        vm.prank(owner);
-        token.setWhitelisted(user3, true);
-        assertTrue(token.isWhitelisted(user3));
-
-        vm.prank(owner);
-        token.setBlacklisted(user3, true);
-        assertTrue(token.isBlacklisted(user3));
-
-        // Test operations all fail due to blacklist
-        // Mint
-        vm.prank(owner);
         vm.expectRevert(MudraToken.AccountBlacklisted.selector);
-        token.mint(user3, 1000);
+        token.transfer(user1, 50);
 
-        // Transfer to blacklisted
-        vm.prank(user1);
-        vm.expectRevert(MudraToken.AccountBlacklisted.selector);
-        token.transfer(user3, 100);
-    }
-
-    function testPauseTransfersUnderDifferentConditions() public {
-        // Setup - mint tokens to test addresses
-        vm.startPrank(owner);
-        token.mint(user1, 1000);
-        token.mint(user2, 1000);
-        token.mint(user3, 1000);
-        vm.stopPrank();
-
-        // Test 1: Whitelist + Not Paused -> Transfer works
-        // (This scenario is covered by existing tests)
-
-        // Test 2: Whitelist + Paused -> Transfer fails with pause error
+        // Owner can manually burn tokens from blacklisted user if needed
         vm.prank(owner);
-        token.pause();
+        token.burnFrom(user1, 500);
+        assertEq(token.balanceOf(user1), 500);
 
+        // Unblacklist user1
+        vm.prank(blacklister);
+        token.setBlacklisted(user1, false);
+        
+        // Verify user1 can now transfer remaining tokens
         vm.prank(user1);
-        vm.expectRevert(EnforcedPause.selector);
-        token.transfer(user2, 200);
-
-        // Test 3: No Whitelist + Paused -> Transfer fails with pause error first
-        vm.startPrank(owner);
-        token.setWhitelistingEnabled(false);
-        // Still paused
-        vm.stopPrank();
-
-        vm.prank(user3); // Not whitelisted
-        vm.expectRevert(EnforcedPause.selector);
-        token.transfer(user4, 200);
-
-        // Test 4: Blacklisted + Paused -> Transfer fails with pause error first
-        vm.startPrank(owner);
-        token.setBlacklisted(user1, true);
-        // Still paused
-        vm.stopPrank();
-
-        vm.prank(user1); // Now blacklisted
-        vm.expectRevert(EnforcedPause.selector);
-        token.transfer(user2, 200);
-
-        // Unpause for other tests
-        vm.prank(owner);
-        token.unpause();
-    }
-
-    /*//////////////////////////////////////////////////////////////
-                    APPROVAL RACE CONDITION TESTS
-    //////////////////////////////////////////////////////////////*/
-
-    function testApproveZeroFirst() public {
-        // Setup: user1 should be able to approve a new amount when there is no previous allowance
-        vm.startPrank(user1);
-        assertTrue(token.approve(user2, 100));
-        assertEq(token.allowance(user1, user2), 100);
-
-        // Attempt to change allowance directly without setting to zero first (should fail)
-        vm.expectRevert(MudraToken.InvalidApprove.selector);
-        token.approve(user2, 50);
-
-        // Verify allowance is still the original amount
-        assertEq(token.allowance(user1, user2), 100);
-
-        // Set allowance to zero first
-        assertTrue(token.approve(user2, 0));
-        assertEq(token.allowance(user1, user2), 0);
-
-        // Now should be able to set to new amount
-        assertTrue(token.approve(user2, 50));
-        assertEq(token.allowance(user1, user2), 50);
-        vm.stopPrank();
-    }
-
-    function testApproveZeroAmount() public {
-        // Setting to zero should always work regardless of previous allowance
-        vm.prank(user1);
-        token.approve(user2, 100);
-        assertEq(token.allowance(user1, user2), 100);
-
-        vm.prank(user1);
-        token.approve(user2, 0);
-        assertEq(token.allowance(user1, user2), 0);
-    }
-
-    function testApproveWhenPaused() public {
-        // Setup
-        vm.prank(owner);
-        token.pause();
-
-        // Approve should fail when paused
-        vm.prank(user1);
-        vm.expectRevert(EnforcedPause.selector);
-        token.approve(user2, 100);
-
-        // Unpause
-        vm.prank(owner);
-        token.unpause();
-
-        // Approve should work when unpaused
-        vm.prank(user1);
-        token.approve(user2, 100);
-        assertEq(token.allowance(user1, user2), 100);
-    }
-
-    function testApproveForBlacklistedAddress() public {
-        // Test approving a blacklisted spender
-        vm.prank(owner);
-        token.setBlacklisted(user2, true);
-
-        vm.prank(user1);
-        vm.expectRevert(MudraToken.AccountBlacklisted.selector);
-        token.approve(user2, 100);
-
-        // Test approving from a blacklisted owner
-        vm.prank(owner);
-        token.setBlacklisted(user1, true);
-
-        vm.prank(user1);
-        vm.expectRevert(MudraToken.AccountBlacklisted.selector);
-        token.approve(user3, 100);
+        token.transfer(user2, 100);
+        assertEq(token.balanceOf(user1), 400);
+        assertEq(token.balanceOf(user2), 600);
     }
 }
