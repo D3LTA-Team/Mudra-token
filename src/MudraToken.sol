@@ -179,6 +179,13 @@ contract MudraToken is ERC20, ERC20Burnable, Ownable, ReentrancyGuard, Pausable 
     function setBlacklisted(address account, bool status) external onlyBlacklister {
         require(account != address(0), InvalidAddress());
         isBlacklisted[account] = status;
+        
+        // Revoke whitelist status when blacklisting (auditor suggestion)
+        if (status && isWhitelisted[account]) {
+            isWhitelisted[account] = false;
+            emit AddressWhitelisted(account, false);
+        }
+        
         emit AddressBlacklisted(account, status);
     }
 
@@ -192,6 +199,13 @@ contract MudraToken is ERC20, ERC20Burnable, Ownable, ReentrancyGuard, Pausable 
         for (uint256 i = 0; i < accounts.length; i++) {
             if (accounts[i] == address(0)) continue; // Skip zero addresses
             isBlacklisted[accounts[i]] = status;
+            
+            // Revoke whitelist status when blacklisting (auditor suggestion)
+            if (status && isWhitelisted[accounts[i]]) {
+                isWhitelisted[accounts[i]] = false;
+                emit AddressWhitelisted(accounts[i], false);
+            }
+            
             emit AddressBlacklisted(accounts[i], status);
         }
     }

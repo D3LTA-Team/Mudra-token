@@ -291,9 +291,14 @@ contract MudraTokenTest is Test {
         vm.prank(owner);
         token.setBlacklisted(user3, false);
         
+        // Re-whitelist user3 (since blacklisting revoked the whitelist status)
+        vm.prank(owner);
+        token.setWhitelisted(user3, true);
+        
         // Verify user3 still has remaining tokens and can now transfer
         assertEq(token.balanceOf(user3), 400);
         assertFalse(token.isBlacklisted(user3));
+        assertTrue(token.isWhitelisted(user3));
         
         vm.prank(user3);
         token.transfer(user1, 100);
@@ -542,18 +547,31 @@ contract MudraTokenTest is Test {
     }
 
     function testBatchBlacklist() public {
+        // First whitelist user3 and user4
+        vm.startPrank(owner);
+        token.setWhitelisted(user3, true);
+        token.setWhitelisted(user4, true);
+        vm.stopPrank();
+        
+        assertTrue(token.isWhitelisted(user3));
+        assertTrue(token.isWhitelisted(user4));
+
         address[] memory users = new address[](3);
         users[0] = user3;
         users[1] = user4;
         users[2] = address(0); // Should be skipped
 
-        // Test batch blacklisting
+        // Test batch blacklisting (should revoke whitelist status)
         vm.prank(blacklister);
         token.batchBlacklist(users, true);
 
         assertTrue(token.isBlacklisted(user3));
         assertTrue(token.isBlacklisted(user4));
         assertFalse(token.isBlacklisted(address(0)));
+        
+        // Verify whitelist status was revoked
+        assertFalse(token.isWhitelisted(user3));
+        assertFalse(token.isWhitelisted(user4));
 
         // Test batch removal from blacklist
         vm.prank(blacklister);
@@ -561,6 +579,10 @@ contract MudraTokenTest is Test {
 
         assertFalse(token.isBlacklisted(user3));
         assertFalse(token.isBlacklisted(user4));
+        
+        // Note: whitelist status remains false after unblacklisting
+        assertFalse(token.isWhitelisted(user3));
+        assertFalse(token.isWhitelisted(user4));
     }
 
     function testBatchBlacklistSizeLimits() public {
@@ -830,10 +852,19 @@ contract MudraTokenTest is Test {
         // Whitelist user3 first
         vm.prank(owner);
         token.setWhitelisted(user3, true);
+        assertTrue(token.isWhitelisted(user3));
         
-        // Now blacklist the same address (this should still work)
+        // Now blacklist the same address (this should revoke whitelist automatically)
         vm.prank(owner);
+        vm.expectEmit(true, true, true, true);
+        emit AddressWhitelisted(user3, false); // Expect whitelist to be revoked
+        vm.expectEmit(true, true, true, true);
+        emit AddressBlacklisted(user3, true);
         token.setBlacklisted(user3, true);
+
+        // Verify user3 is blacklisted and no longer whitelisted
+        assertTrue(token.isBlacklisted(user3));
+        assertFalse(token.isWhitelisted(user3)); // Should be false now
 
         // Verify that transfers to/from this address fail due to blacklisting
         vm.prank(user1);
@@ -1178,8 +1209,11 @@ contract MudraTokenTest is Test {
         assertEq(token.balanceOf(user3), 400);
         
         // 8. Unblacklist and user can transfer remaining tokens
-        vm.prank(owner);
+        vm.startPrank(owner);
         token.setBlacklisted(user3, false);
+        // Re-whitelist user3 (since blacklisting revoked the whitelist status)
+        token.setWhitelisted(user3, true);
+        vm.stopPrank();
         
         vm.prank(user3);
         token.transfer(user1, 200);
@@ -1221,10 +1255,59 @@ contract MudraTokenTest is Test {
         vm.prank(blacklister);
         token.setBlacklisted(user1, false);
         
+        // Re-whitelist user1 (since blacklisting revoked the whitelist status)
+        vm.prank(owner);
+        token.setWhitelisted(user1, true);
+        
         // Verify user1 can now transfer remaining tokens
         vm.prank(user1);
         token.transfer(user2, 100);
         assertEq(token.balanceOf(user1), 400);
         assertEq(token.balanceOf(user2), 600);
+    }
+
+    function testBlacklistingRevokesWhitelistStatus() public {
+        // Test the auditor's suggestion: blacklisting should revoke whitelist status
+        
+        // Setup: whitelist user3
+        vm.prank(owner);
+        token.setWhitelisted(user3, true);
+        assertTrue(token.isWhitelisted(user3));
+        assertFalse(token.isBlacklisted(user3));
+        
+        // Blacklist user3 (should automatically revoke whitelist)
+        vm.prank(owner);
+        vm.expectEmit(true, true, true, true);
+        emit AddressWhitelisted(user3, false); // Expect whitelist revocation event
+        vm.expectEmit(true, true, true, true);
+        emit AddressBlacklisted(user3, true);   // Expect blacklist event
+        token.setBlacklisted(user3, true);
+        
+        // Verify state after blacklisting
+        assertTrue(token.isBlacklisted(user3));
+        assertFalse(token.isWhitelisted(user3)); // Should be automatically revoked
+        
+        // Test batch operation too
+        address[] memory users = new address[](2);
+        users[0] = user4;
+        users[1] = makeAddr("user5");
+        
+        // Whitelist both addresses first
+        vm.startPrank(owner);
+        token.setWhitelisted(user4, true);
+        token.setWhitelisted(users[1], true);
+        vm.stopPrank();
+        
+        assertTrue(token.isWhitelisted(user4));
+        assertTrue(token.isWhitelisted(users[1]));
+        
+        // Batch blacklist should revoke whitelist for both
+        vm.prank(owner);
+        token.batchBlacklist(users, true);
+        
+        assertTrue(token.isBlacklisted(user4));
+        assertTrue(token.isBlacklisted(users[1]));
+        assertFalse(token.isWhitelisted(user4));    // Should be revoked
+        assertFalse(token.isWhitelisted(users[1])); // Should be revoked
     }
 }
